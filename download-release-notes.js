@@ -181,23 +181,123 @@ function cleanReleaseBody(body) {
 }
 
 /**
+ * Parse version string into numeric parts
+ * @param {string} version - Version string (e.g., "9", "8.2", "7.5.9", "v1.2.3")
+ * @returns {Array} - Array of numeric parts
+ */
+function parseVersion(version) {
+  // Remove 'v' prefix if present
+  const cleanVersion = version.replace(/^v/, "");
+
+  // Split and convert to numbers
+  return cleanVersion.split(".").map((part) => {
+    const num = parseInt(part.replace(/[^\d]/g, ""), 10);
+    return isNaN(num) ? 0 : num;
+  });
+}
+
+/**
+ * Check if a version matches a pattern (handles shorthands)
+ * @param {string} version - Full version to check (e.g., "8.2.5")
+ * @param {string} pattern - Pattern to match against (e.g., "8", "8.2", "8.2.5")
+ * @param {string} type - "min" or "max" for different matching behavior
+ * @returns {boolean} - Whether the version matches the pattern
+ */
+function versionMatches(version, pattern, type) {
+  const versionParts = parseVersion(version);
+  const patternParts = parseVersion(pattern);
+
+  // For minimum version: version should be >= pattern
+  // For maximum version: version should be <= pattern
+
+  // Compare only the parts that exist in the pattern
+  for (let i = 0; i < patternParts.length; i++) {
+    const vPart = versionParts[i] || 0;
+    const pPart = patternParts[i];
+
+    if (vPart < pPart) {
+      return type === "max"; // For max, smaller is ok
+    }
+    if (vPart > pPart) {
+      return type === "min"; // For min, larger is ok
+    }
+    // If equal, continue to next part
+  }
+
+  // If all compared parts are equal, it's a match
+  // For shorthand patterns like "8" matching "8.x.x", this is inclusive
+  return true;
+}
+
+/**
+ * Filter releases by version range
+ * @param {Array} releases - Array of release objects
+ * @param {string|null} minVersion - Minimum version (inclusive, supports shorthands)
+ * @param {string|null} maxVersion - Maximum version (inclusive, supports shorthands)
+ * @returns {Array} - Filtered releases
+ */
+function filterReleasesByVersion(releases, minVersion, maxVersion) {
+  if (!minVersion && !maxVersion) {
+    return releases;
+  }
+
+  return releases.filter((release) => {
+    const version = release.tag_name;
+
+    // Check minimum version (inclusive)
+    if (minVersion && !versionMatches(version, minVersion, "min")) {
+      return false;
+    }
+
+    // Check maximum version (inclusive)
+    if (maxVersion && !versionMatches(version, maxVersion, "max")) {
+      return false;
+    }
+
+    return true;
+  });
+}
+
+/**
  * Save releases as a single minimal changelog markdown file
  * @param {Array} releases - Array of release objects
  * @param {string} owner - Repository owner
  * @param {string} repo - Repository name
+ * @param {string|null} minVersion - Minimum version filter
+ * @param {string|null} maxVersion - Maximum version filter
  */
-async function saveReleasesAsMarkdown(releases, repo) {
+async function saveReleasesAsMarkdown(
+  releases,
+  owner,
+  repo,
+  minVersion,
+  maxVersion,
+) {
   const filename = `${repo}-changelog.md`;
   const filepath = path.join(process.cwd(), filename);
+
+  // Filter releases by version range
+  const filteredReleases = filterReleasesByVersion(
+    releases,
+    minVersion,
+    maxVersion,
+  );
 
   // Create changelog content
   let changelogContent = `# ${repo} Changelog\n\n`;
 
-  // Sort releases by published date (newest first)
-  releases.sort((a, b) => new Date(b.published_at) - new Date(a.published_at));
+  if (minVersion || maxVersion) {
+    changelogContent += `Version range: ${minVersion || "any"} to ${maxVersion || "latest"}\n`;
+    changelogContent += `Showing ${filteredReleases.length} of ${releases.length} releases\n\n`;
+  }
 
-  for (let i = 0; i < releases.length; i++) {
-    const release = releases[i];
+  // Sort releases by published date (newest first)
+  filteredReleases.sort(
+    (a, b) => new Date(b.published_at) - new Date(a.published_at),
+  );
+
+  for (let i = 0; i < filteredReleases.length; i++) {
+    const release = filteredReleases[i];
 
     changelogContent += `## ${release.name || release.tag_name}\n\n`;
 
@@ -209,7 +309,7 @@ async function saveReleasesAsMarkdown(releases, repo) {
     }
 
     // Add separator between releases (except for the last one)
-    if (i < releases.length - 1) {
+    if (i < filteredReleases.length - 1) {
       changelogContent += `---\n\n`;
     }
   }
@@ -220,25 +320,89 @@ async function saveReleasesAsMarkdown(releases, repo) {
 }
 
 /**
+ * Parse command line arguments
+ * @param {Array} args - Command line arguments
+ * @returns {Object} - Parsed arguments
+ */
+function parseArgs(args) {
+  const result = {
+    url: null,
+    minVersion: null,
+    maxVersion: null,
+  };
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+
+    if (arg === "--min-version" && i + 1 < args.length) {
+      result.minVersion = args[i + 1];
+      i++; // Skip next argument as it's the value
+    } else if (arg === "--max-version" && i + 1 < args.length) {
+      result.maxVersion = args[i + 1];
+      i++; // Skip next argument as it's the value
+    } else if (
+      !result.url &&
+      (arg.startsWith("http://") || arg.startsWith("https://"))
+    ) {
+      result.url = arg;
+    }
+  }
+
+  return result;
+}
+
+/**
  * Main function
  */
 async function main() {
   const args = process.argv.slice(2);
 
   if (args.length === 0) {
-    console.error("Usage: download-release-notes <github-repo-url>");
+    console.error("Usage: download-release-notes [options] <github-repo-url>");
     console.error("");
-    console.error("Example:");
+    console.error("Options:");
+    console.error(
+      "  --min-version <version>  Minimum version to include (optional)",
+    );
+    console.error(
+      "  --max-version <version>  Maximum version to include (optional)",
+    );
+    console.error("");
+    console.error("Examples:");
     console.error("  download-release-notes https://github.com/samchon/typia");
+    console.error(
+      "  download-release-notes --min-version 8.2 https://github.com/samchon/typia",
+    );
+    console.error(
+      "  download-release-notes --max-version 9 https://github.com/samchon/typia",
+    );
+    console.error(
+      "  download-release-notes --min-version 8.2 --max-version 9 https://github.com/samchon/typia",
+    );
+    console.error(
+      "  download-release-notes --min-version v5.0.0 --max-version v6.0.0 https://github.com/samchon/typia",
+    );
     process.exit(1);
   }
 
-  const repoUrl = args[0];
+  const { url: repoUrl, minVersion, maxVersion } = parseArgs(args);
+
+  if (!repoUrl) {
+    console.error("Error: No GitHub repository URL provided");
+    process.exit(1);
+  }
 
   try {
     // Parse GitHub URL
     const { owner, repo } = parseGitHubUrl(repoUrl);
     console.log(`Repository: ${owner}/${repo}`);
+
+    if (minVersion) {
+      console.log(`Minimum version: ${minVersion}`);
+    }
+    if (maxVersion) {
+      console.log(`Maximum version: ${maxVersion}`);
+    }
 
     // Fetch all releases
     const releases = await fetchAllReleases(owner, repo);
@@ -249,7 +413,7 @@ async function main() {
     }
 
     // Save as markdown file
-    await saveReleasesAsMarkdown(releases, repo);
+    await saveReleasesAsMarkdown(releases, owner, repo, minVersion, maxVersion);
   } catch (error) {
     console.error(`Error: ${error.message}`);
     process.exit(1);
